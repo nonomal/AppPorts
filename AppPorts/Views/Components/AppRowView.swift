@@ -16,15 +16,18 @@ struct AppRowView: View {
     let showMoveBackButton: Bool
     let onDeleteLink: (AppItem) -> Void
     let onMoveBack: (AppItem) -> Void
+    let onResign: ((AppItem) -> Void)?
+    let onRestoreSignature: ((AppItem) -> Void)?
+    var onMoveOutWholeSymlink: ((AppItem) -> Void)? = nil
     
     @State private var isHovered = false
     
     var body: some View {
         HStack(spacing: 14) {
-            AppIconView(url: app.path)
+            AppIconView(url: app.displayURL)
             
             VStack(alignment: .leading, spacing: 4) {
-                Text(app.name)
+                Text(app.displayName)
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(.primary)
                     .lineLimit(1)
@@ -39,7 +42,7 @@ struct AppRowView: View {
                             .foregroundColor(.secondary)
                             .transition(.opacity)
                     } else {
-                        Text("计算中...")
+                        Text("计算中...".localized)
                             .font(.system(size: 10))
                             .foregroundColor(.secondary.opacity(0.5))
                             .transition(.opacity)
@@ -49,7 +52,7 @@ struct AppRowView: View {
             
             Spacer()
             
-            if showDeleteLinkButton && app.status == "已链接" {
+            if showDeleteLinkButton && (app.status == AppStatus.linked || app.status == AppStatus.orphanedLink) {
                 Button(action: { onDeleteLink(app) }) {
                     Image(systemName: "link.badge.plus")
                         .foregroundColor(.red)
@@ -58,7 +61,7 @@ struct AppRowView: View {
                 .padding(6)
                 .background(Color.red.opacity(0.1))
                 .clipShape(Circle())
-                .help("断开此链接并删除文件")
+                .help("断开此链接并删除文件".localized)
             }
             
             if showMoveBackButton {
@@ -70,7 +73,7 @@ struct AppRowView: View {
                 .padding(6)
                 .background(Color.blue.opacity(0.1))
                 .clipShape(Circle())
-                .help("将应用迁移回本地")
+                .help("将应用迁移回本地".localized)
             }
         }
         .padding(.vertical, 10)
@@ -86,30 +89,46 @@ struct AppRowView: View {
             }
         }
         // Accessibility: Combine row into single element
-        .accessibilityElement(children: .combine)
-        // Custom Actions for VoiceOver (Swipe up/down)
-        .accessibilityActions {
-             if showDeleteLinkButton && app.status == "已链接" {
-                 Button(action: { onDeleteLink(app) }) {
-                     Text("断开")
-                 }
-             }
-             
-             if showMoveBackButton {
-                 Button(action: { onMoveBack(app) }) {
-                     Text("还原")
-                 }
-             }
-             
-             Button(action: {
-                 NSWorkspace.shared.activateFileViewerSelecting([app.path])
-             }) {
-                 Text("在 Finder 中显示")
-             }
-        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            Text(app.displayName) + Text(", ") +
+            Text(AppStatus.localized(app.status)) +
+            (app.size.map { Text(", \($0)") } ?? Text(""))
+        )
         .contextMenu {
-            Button("在 Finder 中显示") {
+            Button("在 Finder 中显示".localized) {
                 NSWorkspace.shared.activateFileViewerSelecting([app.path])
+            }
+
+            if (app.status == AppStatus.local || app.status == AppStatus.pendingMoveOut) && !app.isSystemApp, let onMoveOutWholeSymlink {
+                Divider()
+                Button("使用传统链接迁移".localized) {
+                    onMoveOutWholeSymlink(app)
+                }
+            }
+
+            if app.status == AppStatus.orphanedLink {
+                Divider()
+                Button("删除孤立链接".localized) {
+                    onDeleteLink(app)
+                }
+            }
+
+            if app.status == AppStatus.linked {
+                Divider()
+
+                if let onResign {
+                    Button("重签名此应用".localized) {
+                        onResign(app)
+                    }
+                }
+            }
+
+            if let onRestoreSignature, app.isResigned {
+                Divider()
+                Button("恢复原始签名".localized) {
+                    onRestoreSignature(app)
+                }
             }
         }
     }

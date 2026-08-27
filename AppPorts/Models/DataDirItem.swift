@@ -1,0 +1,247 @@
+//
+//  DataDirItem.swift
+//  AppPorts
+//
+//  Created by shimoko.com on 2026/3/4.
+//
+
+import Foundation
+
+// MARK: - 数据目录类型
+
+/// 数据目录的来源类型
+enum DataDirType: String, CaseIterable, Sendable {
+    /// ~/Library/Application Support/ 下的应用数据
+    case applicationSupport = "Application Support"
+    /// ~/Library/Preferences/ 下的应用偏好与配置
+    case preferences = "Preferences"
+    /// ~/Library/Containers/ 下的沙盒应用数据
+    case containers = "Containers"
+    /// ~/Library/Group Containers/ 下的共享数据
+    case groupContainers = "Group Containers"
+    /// ~/Library/Caches/ 下的应用缓存
+    case caches = "Caches"
+    /// ~/Library/WebKit/ 下的 WebKit 本地存储
+    case webKit = "WebKit"
+    /// ~/Library/HTTPStorages/ 下的网络会话数据
+    case httpStorages = "HTTPStorages"
+    /// ~/Library/Application Scripts/ 下的扩展脚本数据
+    case applicationScripts = "Application Scripts"
+    /// ~/Library/Logs/ 下的应用日志
+    case logs = "Logs"
+    /// ~/Library/Saved Application State/ 下的窗口状态
+    case savedState = "Saved State"
+    /// ~/.xxx 工具直写目录
+    case dotFolder = "工具目录"
+    /// 用户手动添加的目录
+    case custom = "自定义"
+
+    /// 显示用图标
+    var icon: String {
+        switch self {
+        case .applicationSupport: return "doc.fill"
+        case .preferences:        return "slider.horizontal.3"
+        case .containers:         return "shippingbox.fill"
+        case .groupContainers:    return "square.grid.2x2.fill"
+        case .caches:             return "arrow.2.circlepath"
+        case .webKit:             return "globe"
+        case .httpStorages:       return "network"
+        case .applicationScripts: return "scroll.fill"
+        case .logs:               return "text.justify.left"
+        case .savedState:         return "clock.arrow.circlepath"
+        case .dotFolder:          return "wrench.fill"
+        case .custom:             return "folder.badge.plus"
+        }
+    }
+
+    var localizedTitle: String {
+        switch self {
+        case .applicationSupport:
+            return "Application Support".localized
+        case .preferences:
+            return "Preferences".localized
+        case .containers:
+            return "Containers".localized
+        case .groupContainers:
+            return "Group Containers".localized
+        case .caches:
+            return "Caches".localized
+        case .webKit:
+            return "WebKit".localized
+        case .httpStorages:
+            return "HTTPStorages".localized
+        case .applicationScripts:
+            return "Application Scripts".localized
+        case .logs:
+            return "Logs".localized
+        case .savedState:
+            return "Saved State".localized
+        case .dotFolder:
+            return "工具目录".localized
+        case .custom:
+            return "自定义".localized
+        }
+    }
+}
+
+// MARK: - 迁移优先级
+
+/// 目录迁移的重要程度建议
+enum DataDirPriority: String, CaseIterable, Sendable, Comparable {
+    /// 重要：迁移后必须正常工作，影响应用核心功能
+    case critical    = "重要"
+    /// 推荐：占用空间大，迁移收益高
+    case recommended = "推荐"
+    /// 可选：空间较小或可重建
+    case optional    = "可选"
+
+    static func < (lhs: DataDirPriority, rhs: DataDirPriority) -> Bool {
+        let order: [DataDirPriority] = [.critical, .recommended, .optional]
+        return order.firstIndex(of: lhs)! < order.firstIndex(of: rhs)!
+    }
+
+    var color: String {
+        switch self {
+        case .critical:    return "red"
+        case .recommended: return "orange"
+        case .optional:    return "blue"
+        }
+    }
+
+    var localizedTitle: String {
+        switch self {
+        case .critical:
+            return "重要".localized
+        case .recommended:
+            return "推荐".localized
+        case .optional:
+            return "可选".localized
+        }
+    }
+}
+
+enum DataDirStatus {
+    static let local = "本地"
+    static let linked = "已链接"
+    static let needsNormalization = "待规范"
+    static let existingSymlink = "现有软链"
+    static let pendingRelink = "待接回"
+    static let missing = "未找到"
+
+    static func localized(_ status: String) -> String {
+        switch status {
+        case local:
+            return "本地".localized
+        case linked:
+            return "已链接".localized
+        case needsNormalization:
+            return "待规范".localized
+        case existingSymlink:
+            return "现有软链".localized
+        case pendingRelink:
+            return "待接回".localized
+        case missing:
+            return "未找到".localized
+        default:
+            return status
+        }
+    }
+}
+
+// MARK: - 数据目录模型
+
+/// 表示一个可迁移的数据目录项
+///
+/// 覆盖两类目录：
+/// - `~/Library/` 下与 `.app` 关联的标准数据目录
+/// - `~/.xxx` 工具直写目录（如 `.npm`、`.m2`、`.ollama`）
+///
+/// ## 使用示例
+/// ```swift
+/// let item = DataDirItem(
+///     name: "npm 缓存",
+///     path: URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".npm"),
+///     type: .dotFolder,
+///     priority: .recommended,
+///     description: "Node.js 包管理器缓存",
+///     isMigratable: true
+/// )
+/// ```
+struct DataDirItem: Identifiable, Equatable, Sendable {
+    // MARK: - 基本属性
+
+    /// 显示名称（如 "npm 缓存", "Application Support"）
+    var name: String
+
+    /// 目录实际路径
+    var path: URL
+
+    /// 基于路径的稳定 ID，避免每次扫描重建列表
+    nonisolated var id: String { path.standardizedFileURL.path }
+
+    /// 目录类型
+    var type: DataDirType
+
+    /// 迁移优先级建议
+    var priority: DataDirPriority
+
+    /// 用途说明（展示给用户）
+    var description: String
+
+    /// 关联的应用名称（仅 Library 类型目录有，dotFolder 为 nil）
+    var associatedAppName: String? = nil
+
+    // MARK: - 状态属性
+
+    /// 当前状态
+    /// - "本地"：正常存在于本机
+    /// - "已链接"：由 AppPorts 迁移到外部，本地为受管符号链接
+    /// - "待规范"：已被 AppPorts 接管，但外部目标仍在非规范路径
+    /// - "现有软链"：检测到已有符号链接，但并非 AppPorts 迁移结果
+    /// - "待接回"：本地路径缺失，但外部已存在可直接接回的目录
+    /// - "未找到"：路径不存在
+    var status: String = "本地"
+
+    /// 目录大小字符串（nil 表示计算中）
+    var size: String? = nil
+
+    /// 目录大小原始字节数
+    var sizeBytes: Int64 = 0
+
+    // MARK: - 权限控制
+
+    /// 是否允许迁移
+    ///
+    /// - Note: `.local`、`.config` 等系统级目录设为 false，只读展示
+    var isMigratable: Bool = true
+
+    /// 不可迁移时的原因说明
+    var nonMigratableReason: String? = nil
+
+    /// 迁移警告（可迁移但有风险时显示，用户确认后仍可继续）
+    var migrationWarning: String? = nil
+
+    // MARK: - 符号链接信息
+
+    /// 如果已链接，链接指向的外部路径
+    var linkedDestination: URL? = nil
+
+    // MARK: - 树形结构
+
+    /// 子目录项（用于 UI 递归渲染）
+    var children: [DataDirItem] = []
+
+    /// 是否为叶子节点（无子目录）
+    var isLeaf: Bool { children.isEmpty }
+
+    // MARK: - Equatable
+    static func == (lhs: DataDirItem, rhs: DataDirItem) -> Bool {
+        lhs.id == rhs.id &&
+        lhs.status == rhs.status &&
+        lhs.size == rhs.size &&
+        lhs.sizeBytes == rhs.sizeBytes &&
+        lhs.linkedDestination == rhs.linkedDestination &&
+        lhs.isMigratable == rhs.isMigratable &&
+        lhs.migrationWarning == rhs.migrationWarning
+    }
+}

@@ -1,0 +1,564 @@
+//
+//  UpdateChecker.swift
+//  AppPorts
+//
+//  Created by shimoko.com on 2026/2/6.
+//
+
+import Foundation
+
+// MARK: - Data Models
+
+/// GitHub Release 信息。
+struct ReleaseInfo: Codable, Equatable {
+    let tagName: String
+    let htmlUrl: String
+    let body: String
+
+    enum CodingKeys: String, CodingKey {
+        case tagName = "tag_name"
+        case htmlUrl = "html_url"
+        case body
+    }
+}
+
+/// 官网 latest.json 信息。
+struct OfficialReleaseInfo: Codable, Equatable {
+    let version: String
+    let tag: String
+    let build: Int
+    let publishedAt: String
+    let minimumSupportedVersion: String
+    let releaseNotes: [String: String]
+    let links: OfficialReleaseLinks
+    let sha256: String
+}
+
+struct OfficialReleaseLinks: Codable, Equatable {
+    let github: String
+    let primaryDownload: String
+    let mirrorDownload: String
+}
+
+/// 更新弹窗使用的统一模型。
+struct AppUpdateInfo: Equatable {
+    enum Source: String {
+        case github
+        case official
+    }
+
+    let version: String
+    let source: Source
+    let releaseNotesMarkdown: String
+    let githubURL: URL?
+    let chinaDownloadURL: URL
+    let sha256: String?
+}
+
+// MARK: - Update Checker
+
+/// 应用更新检查工具。
+///
+/// 同时检查 GitHub Releases API 与 AppPorts 官网 latest.json。任一来源发现新版本即可提示更新；
+/// 两边都有新版本时选择版本号更高者，同版本时优先使用可访问的 GitHub release notes。
+final class UpdateChecker {
+    static let shared = UpdateChecker()
+
+    private static let defaultOfficialFeedURL = URL(string: "https://appports.shimoko.com/latest.json")!
+    private static let defaultChinaDownloadURL = URL(string: "https://file.shimoko.com/AppPorts")!
+
+    private let repoOwner = "wzh4869"
+    private let repoName = "AppPorts"
+    private let session: URLSession
+    private let officialFeedURL: URL
+    private let chinaDownloadURL: URL
+    private let currentVersionProvider: () -> String?
+    private let languageProvider: () -> String
+    private let preferredLanguagesProvider: () -> [String]
+    private let githubUpdatesDisabledProvider: () -> Bool
+
+    init(
+        session: URLSession = .shared,
+        officialFeedURL: URL = UpdateChecker.defaultOfficialFeedURL,
+        chinaDownloadURL: URL = UpdateChecker.defaultChinaDownloadURL,
+        currentVersionProvider: @escaping () -> String? = {
+            Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+        },
+        languageProvider: @escaping () -> String = {
+            LanguageManager.shared.language
+        },
+        preferredLanguagesProvider: @escaping () -> [String] = {
+            Locale.preferredLanguages
+        },
+        githubUpdatesDisabledProvider: @escaping () -> Bool = {
+            ProcessInfo.processInfo.environment["APPPORTS_DISABLE_GITHUB_UPDATE_SOURCE"] == "1"
+                || UserDefaults.standard.bool(forKey: "DisableGitHubUpdateSource")
+        }
+    ) {
+        self.session = session
+        self.officialFeedURL = officialFeedURL
+        self.chinaDownloadURL = chinaDownloadURL
+        self.currentVersionProvider = currentVersionProvider
+        self.languageProvider = languageProvider
+        self.preferredLanguagesProvider = preferredLanguagesProvider
+        self.githubUpdatesDisabledProvider = githubUpdatesDisabledProvider
+    }
+
+    /// 检查是否有应用更新。
+    ///
+    /// - Returns: 有新版本时返回统一更新信息；无更新或两个来源均失败时返回 nil。
+    func checkForUpdates() async -> AppUpdateInfo? {
+        guard let currentVersion = normalizedVersion(currentVersionProvider() ?? "") else {
+            AppLogger.shared.logContext(
+                "跳过更新检查：无法读取当前版本",
+                details: [],
+                level: "WARN"
+            )
+            return nil
+        }
+
+        async let githubOutcome = fetchGitHubUpdateIfEnabled(currentVersion: currentVersion)
+        async let officialOutcome = fetchOfficialUpdate(currentVersion: currentVersion)
+        let outcomes = await (github: githubOutcome, official: officialOutcome)
+
+        if outcomes.github.error != nil, outcomes.official.error != nil {
+            AppLogger.shared.logContext(
+                "更新检查失败：GitHub 与官网更新源均不可用",
+                details: [],
+                level: "WARN"
+            )
+        }
+
+        return chooseUpdate(github: outcomes.github.update, official: outcomes.official.update)
+    }
+
+    // MARK: - Source Fetching
+
+    private func fetchGitHubUpdateIfEnabled(currentVersion: String) async -> SourceFetchOutcome {
+        guard !githubUpdatesDisabledProvider() else {
+            AppLogger.shared.logContext(
+                "跳过 GitHub 更新源：测试开关已开启",
+                details: [],
+                level: "WARN"
+            )
+            return SourceFetchOutcome(update: nil, error: nil)
+        }
+
+        return await fetchGitHubUpdate(currentVersion: currentVersion)
+    }
+
+    private func fetchGitHubUpdate(currentVersion: String) async -> SourceFetchOutcome {
+        do {
+            let release = try await fetchGitHubRelease()
+            guard let version = normalizedVersion(release.tagName),
+                  compareVersions(version, currentVersion) == .orderedDescending else {
+                return SourceFetchOutcome(update: nil, error: nil)
+            }
+
+            let update = AppUpdateInfo(
+                version: version,
+                source: .github,
+                releaseNotesMarkdown: release.body,
+                githubURL: URL(string: release.htmlUrl),
+                chinaDownloadURL: chinaDownloadURL,
+                sha256: nil
+            )
+            return SourceFetchOutcome(update: update, error: nil)
+        } catch {
+            AppLogger.shared.logError("GitHub 更新源检查失败", error: error)
+            return SourceFetchOutcome(update: nil, error: error)
+        }
+    }
+
+    private func fetchOfficialUpdate(currentVersion: String) async -> SourceFetchOutcome {
+        do {
+            let release = try await fetchOfficialRelease()
+            let versionCandidate = release.version.isEmpty ? release.tag : release.version
+            guard let version = normalizedVersion(versionCandidate),
+                  compareVersions(version, currentVersion) == .orderedDescending else {
+                return SourceFetchOutcome(update: nil, error: nil)
+            }
+
+            let update = AppUpdateInfo(
+                version: version,
+                source: .official,
+                releaseNotesMarkdown: localizedReleaseNotes(from: release.releaseNotes),
+                githubURL: officialGitHubURL(for: release),
+                chinaDownloadURL: chinaDownloadURL,
+                sha256: release.sha256.isEmpty ? nil : release.sha256
+            )
+            return SourceFetchOutcome(update: update, error: nil)
+        } catch {
+            AppLogger.shared.logError("官网更新源检查失败", error: error)
+            return SourceFetchOutcome(update: nil, error: error)
+        }
+    }
+
+    private func fetchGitHubRelease() async throws -> ReleaseInfo {
+        do {
+            return try await fetchGitHubAPIRelease()
+        } catch {
+            AppLogger.shared.logContext(
+                "GitHub API 更新源不可用，尝试 Atom 更新源",
+                details: [("error", error.localizedDescription)],
+                level: "WARN"
+            )
+            return try await fetchGitHubAtomRelease()
+        }
+    }
+
+    private func fetchGitHubAPIRelease() async throws -> ReleaseInfo {
+        let url = URL(string: "https://api.github.com/repos/\(repoOwner)/\(repoName)/releases/latest")!
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        request.addValue("AppPorts-UpdateChecker", forHTTPHeaderField: "User-Agent")
+        return try await fetchJSON(ReleaseInfo.self, request: request, sourceName: "GitHub")
+    }
+
+    private func fetchGitHubAtomRelease() async throws -> ReleaseInfo {
+        let url = URL(string: "https://github.com/\(repoOwner)/\(repoName)/releases.atom")!
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        request.addValue("AppPorts-UpdateChecker", forHTTPHeaderField: "User-Agent")
+
+        let data = try await fetchData(request: request, sourceName: "GitHub Atom")
+        return try parseGitHubAtomRelease(data)
+    }
+
+    private func fetchOfficialRelease() async throws -> OfficialReleaseInfo {
+        var request = URLRequest(url: officialFeedURL)
+        request.timeoutInterval = 10
+        request.addValue("AppPorts-UpdateChecker", forHTTPHeaderField: "User-Agent")
+        return try await fetchJSON(OfficialReleaseInfo.self, request: request, sourceName: "Official")
+    }
+
+    private func fetchJSON<T: Decodable>(_ type: T.Type, request: URLRequest, sourceName: String) async throws -> T {
+        let data = try await fetchData(request: request, sourceName: sourceName)
+        return try JSONDecoder().decode(type, from: data)
+    }
+
+    private func fetchData(request: URLRequest, sourceName: String) async throws -> Data {
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw UpdateCheckerError.invalidResponse(source: sourceName)
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw UpdateCheckerError.invalidStatusCode(source: sourceName, statusCode: httpResponse.statusCode)
+        }
+        return data
+    }
+
+    private func parseGitHubAtomRelease(_ data: Data) throws -> ReleaseInfo {
+        let parser = XMLParser(data: data)
+        let delegate = GitHubAtomReleaseParser()
+        parser.delegate = delegate
+
+        guard parser.parse(), let entry = delegate.firstEntry else {
+            throw UpdateCheckerError.invalidResponse(source: "GitHub Atom")
+        }
+
+        return ReleaseInfo(
+            tagName: entry.title,
+            htmlUrl: entry.link,
+            body: markdownFromGitHubHTML(entry.content)
+        )
+    }
+
+    // MARK: - Selection
+
+    private func chooseUpdate(github: AppUpdateInfo?, official: AppUpdateInfo?) -> AppUpdateInfo? {
+        switch (github, official) {
+        case (nil, nil):
+            return nil
+        case let (github?, nil):
+            return github
+        case let (nil, official?):
+            return official
+        case let (github?, official?):
+            switch compareVersions(github.version, official.version) {
+            case .orderedDescending:
+                return github
+            case .orderedAscending:
+                return official
+            case .orderedSame:
+                return github
+            }
+        }
+    }
+
+    private func officialGitHubURL(for release: OfficialReleaseInfo) -> URL? {
+        if let url = URL(string: release.links.github), !release.links.github.isEmpty {
+            return url
+        }
+
+        let rawTag = release.tag.isEmpty ? release.version : release.tag
+        guard let tag = normalizedVersion(rawTag) else { return nil }
+        return URL(string: "https://github.com/\(repoOwner)/\(repoName)/releases/tag/\(tag)")
+    }
+
+    // MARK: - Release Notes Language
+
+    private func localizedReleaseNotes(from releaseNotes: [String: String]) -> String {
+        let candidates = releaseNoteLanguageCandidates()
+        for candidate in candidates {
+            if let notes = releaseNotes[candidate], !notes.isEmpty {
+                return notes
+            }
+        }
+
+        if let fallback = releaseNotes["zh-Hans"], !fallback.isEmpty {
+            return fallback
+        }
+        if let fallback = releaseNotes["en"], !fallback.isEmpty {
+            return fallback
+        }
+        return releaseNotes.values.first(where: { !$0.isEmpty }) ?? ""
+    }
+
+    private func releaseNoteLanguageCandidates() -> [String] {
+        let selectedLanguage = languageProvider()
+        let rawLanguages: [String]
+        if selectedLanguage == "system" {
+            rawLanguages = preferredLanguagesProvider()
+        } else {
+            rawLanguages = [selectedLanguage]
+        }
+
+        var result: [String] = []
+        for rawLanguage in rawLanguages {
+            for candidate in normalizedLanguageCandidates(for: rawLanguage) where !result.contains(candidate) {
+                result.append(candidate)
+            }
+        }
+        return result
+    }
+
+    private func normalizedLanguageCandidates(for rawLanguage: String) -> [String] {
+        let normalized = rawLanguage.replacingOccurrences(of: "_", with: "-")
+        guard !normalized.isEmpty else { return [] }
+
+        var candidates = [normalized]
+        let lowercased = normalized.lowercased()
+        if lowercased.hasPrefix("zh-hant")
+            || lowercased.hasPrefix("zh-tw")
+            || lowercased.hasPrefix("zh-hk")
+            || lowercased.hasPrefix("zh-mo") {
+            candidates.append("zh-Hant")
+        } else if lowercased.hasPrefix("zh") {
+            candidates.append("zh-Hans")
+        }
+
+        if let languageCode = normalized.split(separator: "-").first.map(String.init),
+           languageCode != normalized {
+            candidates.append(languageCode)
+        }
+        return candidates
+    }
+
+    // MARK: - Version Comparison
+
+    private func normalizedVersion(_ value: String) -> String? {
+        var result = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if result.lowercased().hasPrefix("v") {
+            result.removeFirst()
+        }
+        guard !result.isEmpty, parseVersion(result) != nil else { return nil }
+        return result
+    }
+
+    private func compareVersions(_ firstVersion: String, _ secondVersion: String) -> ComparisonResult {
+        guard let firstComponents = parseVersion(firstVersion),
+              let secondComponents = parseVersion(secondVersion) else {
+            return firstVersion.compare(secondVersion, options: .numeric)
+        }
+
+        let count = max(firstComponents.count, secondComponents.count)
+        for index in 0..<count {
+            let first = index < firstComponents.count ? firstComponents[index] : 0
+            let second = index < secondComponents.count ? secondComponents[index] : 0
+
+            if first > second { return .orderedDescending }
+            if first < second { return .orderedAscending }
+        }
+        return .orderedSame
+    }
+
+    private func parseVersion(_ version: String) -> [Int]? {
+        let parts = version.split(separator: ".", omittingEmptySubsequences: false)
+        guard !parts.isEmpty else { return nil }
+
+        var numbers: [Int] = []
+        for part in parts {
+            guard let number = Int(part) else { return nil }
+            numbers.append(number)
+        }
+        return numbers
+    }
+
+    private func markdownFromGitHubHTML(_ html: String) -> String {
+        var text = replaceHTMLLinks(in: html)
+        let replacements: [(pattern: String, value: String)] = [
+            (#"(?i)<h1[^>]*>"#, "\n# "),
+            (#"(?i)</h1>"#, "\n\n"),
+            (#"(?i)<h2[^>]*>"#, "\n## "),
+            (#"(?i)</h2>"#, "\n\n"),
+            (#"(?i)<h3[^>]*>"#, "\n### "),
+            (#"(?i)</h3>"#, "\n\n"),
+            (#"(?i)<p[^>]*>"#, ""),
+            (#"(?i)</p>"#, "\n\n"),
+            (#"(?i)<br\s*/?>"#, "\n"),
+            (#"(?i)<li[^>]*>"#, "- "),
+            (#"(?i)</li>"#, "\n"),
+            (#"(?i)<strong[^>]*>"#, "**"),
+            (#"(?i)</strong>"#, "**"),
+            (#"(?i)<b[^>]*>"#, "**"),
+            (#"(?i)</b>"#, "**"),
+            (#"(?i)<em[^>]*>"#, "*"),
+            (#"(?i)</em>"#, "*"),
+            (#"(?i)<i[^>]*>"#, "*"),
+            (#"(?i)</i>"#, "*"),
+            (#"(?i)<code[^>]*>"#, "`"),
+            (#"(?i)</code>"#, "`"),
+            (#"(?i)<pre[^>]*>"#, "\n```text\n"),
+            (#"(?i)</pre>"#, "\n```\n\n"),
+            (#"(?i)<div[^>]*>"#, "\n"),
+            (#"(?i)</div>"#, "\n")
+        ]
+
+        for replacement in replacements {
+            text = text.replacingOccurrences(
+                of: replacement.pattern,
+                with: replacement.value,
+                options: .regularExpression
+            )
+        }
+
+        text = text.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+        text = text.replacingOccurrences(of: "&quot;", with: "\"")
+        text = text.replacingOccurrences(of: "&apos;", with: "'")
+        text = text.replacingOccurrences(of: "&amp;", with: "&")
+        text = text.replacingOccurrences(of: "&lt;", with: "<")
+        text = text.replacingOccurrences(of: "&gt;", with: ">")
+        text = text.replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func replaceHTMLLinks(in html: String) -> String {
+        let pattern = #"<a\s+[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#
+        guard let regex = try? NSRegularExpression(
+            pattern: pattern,
+            options: [.caseInsensitive, .dotMatchesLineSeparators]
+        ) else {
+            return html
+        }
+
+        var result = html
+        let range = NSRange(result.startIndex..<result.endIndex, in: result)
+        let matches = regex.matches(in: result, range: range)
+
+        for match in matches.reversed() {
+            guard match.numberOfRanges >= 3,
+                  let fullRange = Range(match.range(at: 0), in: result),
+                  let hrefRange = Range(match.range(at: 1), in: result),
+                  let textRange = Range(match.range(at: 2), in: result) else {
+                continue
+            }
+
+            let href = String(result[hrefRange])
+            let linkText = String(result[textRange])
+                .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+            result.replaceSubrange(fullRange, with: "[\(linkText)](\(href))")
+        }
+
+        return result
+    }
+}
+
+private struct SourceFetchOutcome {
+    let update: AppUpdateInfo?
+    let error: Error?
+}
+
+private struct GitHubAtomEntry {
+    var title = ""
+    var link = ""
+    var content = ""
+}
+
+private final class GitHubAtomReleaseParser: NSObject, XMLParserDelegate {
+    private(set) var firstEntry: GitHubAtomEntry?
+    private var currentEntry: GitHubAtomEntry?
+    private var currentElement: String?
+    private var currentText = ""
+
+    func parser(
+        _ parser: XMLParser,
+        didStartElement elementName: String,
+        namespaceURI: String?,
+        qualifiedName qName: String?,
+        attributes attributeDict: [String: String] = [:]
+    ) {
+        guard firstEntry == nil else { return }
+
+        switch elementName {
+        case "entry":
+            currentEntry = GitHubAtomEntry()
+        case "title", "content":
+            guard currentEntry != nil else { return }
+            currentElement = elementName
+            currentText = ""
+        case "link":
+            guard currentEntry != nil,
+                  attributeDict["rel"] == "alternate",
+                  let href = attributeDict["href"] else { return }
+            currentEntry?.link = href
+        default:
+            break
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        guard currentElement != nil else { return }
+        currentText += string
+    }
+
+    func parser(
+        _ parser: XMLParser,
+        didEndElement elementName: String,
+        namespaceURI: String?,
+        qualifiedName qName: String?
+    ) {
+        guard firstEntry == nil else { return }
+
+        if elementName == currentElement {
+            let value = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if elementName == "title" {
+                currentEntry?.title = value
+            } else if elementName == "content" {
+                currentEntry?.content = value
+            }
+            currentElement = nil
+            currentText = ""
+            return
+        }
+
+        if elementName == "entry", let entry = currentEntry {
+            firstEntry = entry
+            currentEntry = nil
+        }
+    }
+}
+
+private enum UpdateCheckerError: LocalizedError {
+    case invalidResponse(source: String)
+    case invalidStatusCode(source: String, statusCode: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case let .invalidResponse(source):
+            return "\(source) update source returned an invalid response"
+        case let .invalidStatusCode(source, statusCode):
+            return "\(source) update source returned HTTP \(statusCode)"
+        }
+    }
+}
